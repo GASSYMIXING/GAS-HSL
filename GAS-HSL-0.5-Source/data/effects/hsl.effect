@@ -1,0 +1,140 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float4 master_hsl;
+uniform float4 red_hsl;
+uniform float4 orange_hsl;
+uniform float4 yellow_hsl;
+uniform float4 green_hsl;
+uniform float4 cyan_hsl;
+uniform float4 blue_hsl;
+uniform float4 purple_hsl;
+uniform float4 magenta_hsl;
+uniform float4 custom_hsl;
+uniform float4 custom_color;
+
+sampler_state linear_sampler {
+    Filter = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+    VertData output;
+    output.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    output.uv = v_in.uv;
+    return output;
+}
+
+float3 rgb_to_hsl(float3 rgb)
+{
+    float hi = max(rgb.r, max(rgb.g, rgb.b));
+    float lo = min(rgb.r, min(rgb.g, rgb.b));
+    float chroma = hi - lo;
+    float lightness = (hi + lo) * 0.5;
+    if (chroma < 0.000001)
+        return float3(0.0, 0.0, lightness);
+
+    float saturation = chroma / max(1.0 - abs(2.0 * lightness - 1.0), 0.000001);
+    float hue;
+    if (hi == rgb.r)
+        hue = (rgb.g - rgb.b) / chroma;
+    else if (hi == rgb.g)
+        hue = (rgb.b - rgb.r) / chroma + 2.0;
+    else
+        hue = (rgb.r - rgb.g) / chroma + 4.0;
+    return float3(frac(hue / 6.0), saturate(saturation), lightness);
+}
+
+float3 hsl_to_rgb(float3 hsl)
+{
+    float3 hue_shape = saturate(abs(frac(hsl.x + float3(0.0, 0.6666667, 0.3333333)) * 6.0 - 3.0) - 1.0);
+    float chroma = (1.0 - abs(2.0 * hsl.z - 1.0)) * hsl.y;
+    return hsl.z + (hue_shape - 0.5) * chroma;
+}
+
+float circular_distance(float hue, float center)
+{
+    float distance = abs(hue - center);
+    return min(distance, 1.0 - distance);
+}
+
+float hue_mask(float hue, float center_degrees, float range_degrees)
+{
+    float distance = circular_distance(hue, center_degrees / 360.0);
+    return 1.0 - smoothstep(0.0, range_degrees / 360.0, distance);
+}
+
+float adjust_saturation(float saturation, float amount)
+{
+    return amount >= 0.0
+        ? saturation + (1.0 - saturation) * amount * 0.65
+        : saturation * (1.0 + amount * 0.85);
+}
+
+float adjust_lightness(float lightness, float amount)
+{
+    return amount >= 0.0
+        ? lightness + (1.0 - lightness) * amount * 0.65
+        : lightness * (1.0 + amount * 0.65);
+}
+
+float4 PSHSL(VertData v_in) : TARGET
+{
+    float4 pixel = image.Sample(linear_sampler, v_in.uv);
+    float3 straight_rgb = pixel.a > 0.000001 ? pixel.rgb / pixel.a : float3(0.0, 0.0, 0.0);
+    float3 hsl = rgb_to_hsl(saturate(straight_rgb));
+
+    // Order: master, masks from the adjusted hue, then weighted regional controls.
+    // Low saturation suppresses hue shifts and regional edits smoothly.
+    float protection = smoothstep(0.02, 0.12, hsl.y);
+    hsl.x = frac(hsl.x + master_hsl.x * protection);
+    hsl.y = saturate(adjust_saturation(hsl.y, master_hsl.y));
+    hsl.z = saturate(adjust_lightness(hsl.z, master_hsl.z));
+
+    // Region geometry is defined in one place: center and soft outer radius, in degrees.
+    float red_weight = hue_mask(hsl.x, 0.0, 48.0);
+    float orange_weight = hue_mask(hsl.x, 30.0, 48.0);
+    float yellow_weight = hue_mask(hsl.x, 60.0, 65.0);
+    float green_weight = hue_mask(hsl.x, 120.0, 72.0);
+    float cyan_weight = hue_mask(hsl.x, 180.0, 72.0);
+    float blue_weight = hue_mask(hsl.x, 235.0, 62.0);
+    float purple_weight = hue_mask(hsl.x, 275.0, 58.0);
+    float magenta_weight = hue_mask(hsl.x, 320.0, 58.0);
+    float selection_hue = hsl.x;
+    float weight_sum = red_weight + orange_weight + yellow_weight + green_weight +
+                       cyan_weight + blue_weight + purple_weight + magenta_weight;
+    float normalization = protection / max(weight_sum, 0.000001);
+
+    float3 adjustment = red_hsl.xyz * red_weight + orange_hsl.xyz * orange_weight +
+                        yellow_hsl.xyz * yellow_weight + green_hsl.xyz * green_weight +
+                        cyan_hsl.xyz * cyan_weight + blue_hsl.xyz * blue_weight +
+                        purple_hsl.xyz * purple_weight + magenta_hsl.xyz * magenta_weight;
+    adjustment *= normalization;
+    hsl.x = frac(hsl.x + adjustment.x);
+    hsl.y = saturate(adjust_saturation(hsl.y, adjustment.y));
+    hsl.z = saturate(adjust_lightness(hsl.z, adjustment.z));
+
+    // The picked color adds a ninth, independent soft hue region. It does not
+    // change the eight-region blend when its HSL controls are zero.
+    float3 selected = rgb_to_hsl(saturate(custom_color.rgb));
+    float custom_weight = hue_mask(selection_hue, selected.x * 360.0, 45.0) *
+                          smoothstep(0.02, 0.12, selected.y) * protection;
+    hsl.x = frac(hsl.x + custom_hsl.x * custom_weight);
+    hsl.y = saturate(adjust_saturation(hsl.y, custom_hsl.y * custom_weight));
+    hsl.z = saturate(adjust_lightness(hsl.z, custom_hsl.z * custom_weight));
+    return float4(saturate(hsl_to_rgb(hsl)) * pixel.a, pixel.a);
+}
+
+technique Draw
+{
+    pass {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader = PSHSL(v_in);
+    }
+}
